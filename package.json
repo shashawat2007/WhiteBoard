@@ -1,8 +1,13 @@
 {
   "name": "whiteboard",
   "private": true,
-  "scripts": { "dev": "next dev", "build": "next build", "start": "next start" },
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start"
+  },
   "dependencies": {
+    "@clerk/nextjs": "^7.9.14",
     "@liveblocks/client": "^2.15.0",
     "@liveblocks/react": "^2.15.0",
     "next": "^15.1.0",

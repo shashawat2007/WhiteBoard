@@ -1,17 +1,19 @@
 "use client";
 
-import { useRef, useState, memo, type PointerEvent as PE } from "react";
+import { useEffect, useRef, useState, memo, type PointerEvent as PE } from "react";
 import { useParams } from "next/navigation";
+import { useUser } from "@clerk/nextjs";
 import { getStroke } from "perfect-freehand";
-import { LiveObject } from "@liveblocks/client";
+import { LiveList, LiveObject } from "@liveblocks/client";
 import {
   RoomProvider, ClientSideSuspense, useOthers, useMyPresence, useStorage, useMutation, initialStorage,
 } from "@/liveblocks.config";
-import type { Stroke } from "@/types";
+import type { Shape, Stroke } from "@/types";
 
 const COLORS = ["#111827", "#ef4444", "#f59e0b", "#10b981", "#3b82f6", "#8b5cf6"];
 const NOTE_COLORS = ["#fef08a", "#fbcfe8", "#bae6fd", "#bbf7d0"];
 const SIZE = 6;
+type Tool = "pen" | Shape["kind"];
 
 const toPath = (s: Stroke) => {
   const o = getStroke(s.points as number[][], {
@@ -94,14 +96,33 @@ const StickyNote = memo(function StickyNote({ id }: { id: string }) {
 
 function Board() {
   const [me, setMe] = useMyPresence();
+  const { user, isLoaded, isSignedIn } = useUser();
   const [color, setColor] = useState(COLORS[0]);
+  const [tool, setTool] = useState<Tool>("pen");
+  const [copied, setCopied] = useState(false);
   const others = useOthers();
   const strokes = useStorage((r) => r.strokes);
+  const shapes = useStorage((r) => r.shapes ?? []);
   const noteIds = useStorage((r) => r.notes.map((n) => n.id), (a, b) => a.length === b.length && a.every((v, i) => v === b[i]));
   const draft = useRef<Stroke | null>(null);
+  const shapeDraft = useRef<Shape | null>(null);
+
+  useEffect(() => {
+    const name = user?.fullName ?? user?.username ?? user?.primaryEmailAddress?.emailAddress.split("@")[0];
+    if (isLoaded && isSignedIn && name) setMe({ name });
+  }, [isLoaded, isSignedIn, setMe, user]);
 
   const addStroke = useMutation(({ storage }, s: Stroke) => { storage.get("strokes").push(s); }, []);
-  const clear = useMutation(({ storage }) => { storage.get("strokes").clear(); storage.get("notes").clear(); }, []);
+  const addShape = useMutation(({ storage }, shape: Shape) => {
+    const storedShapes = storage.get("shapes");
+    if (storedShapes) storedShapes.push(shape);
+    else storage.set("shapes", new LiveList([shape]));
+  }, []);
+  const clear = useMutation(({ storage }) => {
+    storage.get("strokes").clear();
+    storage.get("shapes")?.clear();
+    storage.get("notes").clear();
+  }, []);
   const addNote = useMutation(({ storage }) => {
     storage.get("notes").push(new LiveObject({
       id: crypto.randomUUID(),
@@ -116,26 +137,44 @@ function Board() {
 
   const down = (e: PE<SVGSVGElement>) => {
     e.currentTarget.setPointerCapture(e.pointerId);
-    draft.current = { points: [[e.clientX, e.clientY, e.pressure]], color, size: SIZE };
-    setMe({ draft: draft.current, cursor: pos(e) });
+    if (tool === "pen") {
+      draft.current = { points: [[e.clientX, e.clientY, e.pressure]], color, size: SIZE };
+      setMe({ draft: draft.current, draftShape: null, cursor: pos(e) });
+    } else {
+      shapeDraft.current = {
+        id: crypto.randomUUID(), kind: tool, x: e.clientX, y: e.clientY,
+        width: 0, height: 0, color, strokeWidth: SIZE,
+      };
+      setMe({ draft: null, draftShape: shapeDraft.current, cursor: pos(e) });
+    }
   };
   const move = (e: PE<SVGSVGElement>) => {
     if (draft.current) {
       draft.current = { ...draft.current, points: [...draft.current.points, [e.clientX, e.clientY, e.pressure]] };
       setMe({ draft: draft.current, cursor: pos(e) });
+    } else if (shapeDraft.current) {
+      shapeDraft.current = {
+        ...shapeDraft.current,
+        width: e.clientX - shapeDraft.current.x,
+        height: e.clientY - shapeDraft.current.y,
+      };
+      setMe({ draftShape: shapeDraft.current, cursor: pos(e) });
     } else setMe({ cursor: pos(e) });
   };
   const up = () => {
-    if (!draft.current) return;
-    if (draft.current.points.length > 1) addStroke(draft.current);
+    if (draft.current && draft.current.points.length > 1) addStroke(draft.current);
+    if (shapeDraft.current && (Math.abs(shapeDraft.current.width) > 2 || Math.abs(shapeDraft.current.height) > 2)) {
+      addShape(shapeDraft.current);
+    }
     draft.current = null;
-    setMe({ draft: null });
+    shapeDraft.current = null;
+    setMe({ draft: null, draftShape: null });
   };
 
   return (
     <main className="relative h-screen w-screen overflow-hidden bg-neutral-50 [background-image:radial-gradient(#d4d4d8_1px,transparent_1px)] [background-size:20px_20px]">
       <svg
-        className="absolute inset-0 h-full w-full touch-none cursor-crosshair"
+        className={`absolute inset-0 h-full w-full touch-none ${tool === "pen" ? "cursor-crosshair" : "cursor-cell"}`}
         onPointerDown={down}
         onPointerMove={move}
         onPointerUp={up}
@@ -143,10 +182,15 @@ function Board() {
         onPointerLeave={() => setMe({ cursor: null })}
       >
         {strokes.map((s, i) => <path key={i} d={toPath(s as Stroke)} fill={s.color} />)}
+        {shapes.map((shape) => <ShapeView key={shape.id} shape={shape} />)}
         {others.map(({ connectionId, presence }) =>
           presence.draft ? <path key={connectionId} d={toPath(presence.draft)} fill={presence.draft.color} opacity={0.8} /> : null
         )}
+        {others.map(({ connectionId, presence }) =>
+          presence.draftShape ? <ShapeView key={`shape-${connectionId}`} shape={presence.draftShape} preview /> : null
+        )}
         {me.draft && <path d={toPath(me.draft)} fill={me.draft.color} />}
+        {me.draftShape && <ShapeView shape={me.draftShape} preview />}
       </svg>
 
       {noteIds.map((id) => <StickyNote key={id} id={id} />)}
@@ -155,7 +199,38 @@ function Board() {
         presence.cursor ? <Cursor key={connectionId} {...presence.cursor} color={presence.color} name={presence.name} /> : null
       )}
 
-      <div className="fixed bottom-6 left-1/2 z-40 flex -translate-x-1/2 items-center gap-2 rounded-2xl border border-black/5 bg-white/90 px-3 py-2 shadow-xl backdrop-blur">
+      <header className="fixed left-5 top-5 z-40 flex items-center gap-3 rounded-2xl border border-black/5 bg-white/90 px-4 py-2.5 shadow-lg backdrop-blur">
+        <a href="/" className="font-bold tracking-tight text-gray-900">canvas<span className="text-violet-600">.</span></a>
+        <span className="h-5 w-px bg-gray-200" />
+        <button
+          onClick={async () => {
+            try {
+              await navigator.clipboard.writeText(window.location.href);
+              setCopied(true);
+              window.setTimeout(() => setCopied(false), 1800);
+            } catch {
+              window.alert("Clipboard access is unavailable. Copy the URL from your address bar.");
+            }
+          }}
+          className="text-sm font-medium text-gray-600 hover:text-gray-900"
+        >
+          {copied ? "Copied!" : "Share board"}
+        </button>
+      </header>
+
+      <div className="fixed bottom-6 left-1/2 z-40 flex max-w-[calc(100vw-24px)] -translate-x-1/2 flex-wrap items-center justify-center gap-2 rounded-2xl border border-black/5 bg-white/95 px-3 py-2 shadow-xl backdrop-blur">
+        {(["pen", "rectangle", "ellipse", "line"] as Tool[]).map((item) => (
+          <button
+            key={item}
+            onClick={() => setTool(item)}
+            aria-label={`Select ${item} tool`}
+            title={item[0].toUpperCase() + item.slice(1)}
+            className={`rounded-lg px-2.5 py-1.5 text-sm font-medium capitalize ${tool === item ? "bg-violet-100 text-violet-800" : "text-gray-600 hover:bg-gray-100"}`}
+          >
+            {item === "pen" ? "✎" : item === "rectangle" ? "□" : item === "ellipse" ? "◯" : "／"}
+          </button>
+        ))}
+        <span className="mx-1 h-6 w-px bg-gray-200" />
         {COLORS.map((c) => (
           <button
             key={c}
@@ -178,11 +253,39 @@ function Board() {
   );
 }
 
+function ShapeView({ shape, preview = false }: { shape: Shape; preview?: boolean }) {
+  const style = { fill: "none", stroke: shape.color, strokeWidth: shape.strokeWidth, opacity: preview ? 0.75 : 1 };
+  if (shape.kind === "line") {
+    return <line x1={shape.x} y1={shape.y} x2={shape.x + shape.width} y2={shape.y + shape.height} {...style} />;
+  }
+  if (shape.kind === "ellipse") {
+    return (
+      <ellipse
+        cx={shape.x + shape.width / 2}
+        cy={shape.y + shape.height / 2}
+        rx={Math.abs(shape.width) / 2}
+        ry={Math.abs(shape.height) / 2}
+        {...style}
+      />
+    );
+  }
+  return (
+    <rect
+      x={Math.min(shape.x, shape.x + shape.width)}
+      y={Math.min(shape.y, shape.y + shape.height)}
+      width={Math.abs(shape.width)}
+      height={Math.abs(shape.height)}
+      {...style}
+    />
+  );
+}
+
 export default function Page() {
   const { roomId } = useParams<{ roomId: string }>();
   const [init] = useState(() => ({
     cursor: null,
     draft: null,
+    draftShape: null,
     name: `User ${Math.floor(Math.random() * 900 + 100)}`,
     color: COLORS[1 + Math.floor(Math.random() * (COLORS.length - 1))],
   }));

@@ -15,5 +15,6 @@ export { RoomProvider, ClientSideSuspense };
 
 export const initialStorage = (): Storage => ({
   strokes: new LiveList([]),
+  shapes: new LiveList([]),
   notes: new LiveList<LiveObject<Note>>([]),
 });
