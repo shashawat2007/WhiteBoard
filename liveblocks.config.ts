@@ -10,7 +10,9 @@ const client = createClient({
 
 const { RoomProvider, suspense } = createRoomContext<Presence, Storage, UserMeta>(client);
 
-export const { useOthers, useMyPresence, useStorage, useMutation } = suspense;
+export const {
+  useOthers, useMyPresence, useStorage, useMutation, useUndo, useRedo, useCanUndo, useCanRedo,
+} = suspense;
 export { RoomProvider, ClientSideSuspense };
 
 export const initialStorage = (): Storage => ({

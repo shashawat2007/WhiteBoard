@@ -6,7 +6,8 @@ import { useUser } from "@clerk/nextjs";
 import { getStroke } from "perfect-freehand";
 import { LiveList, LiveObject } from "@liveblocks/client";
 import {
-  RoomProvider, ClientSideSuspense, useOthers, useMyPresence, useStorage, useMutation, initialStorage,
+  RoomProvider, ClientSideSuspense, useOthers, useMyPresence, useStorage, useMutation, useUndo, useRedo,
+  useCanUndo, useCanRedo, initialStorage,
 } from "@/liveblocks.config";
 import type { Shape, Stroke } from "@/types";
 
@@ -14,6 +15,10 @@ const COLORS = ["#111827", "#ef4444", "#f59e0b", "#10b981", "#3b82f6", "#8b5cf6"
 const NOTE_COLORS = ["#fef08a", "#fbcfe8", "#bae6fd", "#bbf7d0"];
 const SIZE = 6;
 type Tool = "pen" | Shape["kind"];
+
+const escapeXml = (value: string) => value.replace(/[<>&"']/g, (character) => ({
+  "<": "&lt;", ">": "&gt;", "&": "&amp;", '"': "&quot;", "'": "&apos;",
+}[character] ?? character));
 
 const toPath = (s: Stroke) => {
   const o = getStroke(s.points as number[][], {
@@ -94,16 +99,24 @@ const StickyNote = memo(function StickyNote({ id }: { id: string }) {
   );
 });
 
-function Board() {
+function Board({ roomId }: { roomId: string }) {
   const [me, setMe] = useMyPresence();
   const { user, isLoaded, isSignedIn } = useUser();
   const [color, setColor] = useState(COLORS[0]);
   const [tool, setTool] = useState<Tool>("pen");
   const [copied, setCopied] = useState(false);
+  const [exportMessage, setExportMessage] = useState("");
   const others = useOthers();
   const strokes = useStorage((r) => r.strokes);
   const shapes = useStorage((r) => r.shapes ?? []);
+  const notes = useStorage((r) => r.notes.map((note) => ({
+    id: note.id, x: note.x, y: note.y, text: note.text, color: note.color,
+  })));
   const noteIds = useStorage((r) => r.notes.map((n) => n.id), (a, b) => a.length === b.length && a.every((v, i) => v === b[i]));
+  const undo = useUndo();
+  const redo = useRedo();
+  const canUndo = useCanUndo();
+  const canRedo = useCanRedo();
   const draft = useRef<Stroke | null>(null);
   const shapeDraft = useRef<Shape | null>(null);
 
@@ -132,6 +145,95 @@ function Board() {
       color: NOTE_COLORS[Math.floor(Math.random() * NOTE_COLORS.length)],
     }));
   }, []);
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      const target = event.target;
+      const isEditing = target instanceof HTMLElement &&
+        (target.isContentEditable || ["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName));
+      if (isEditing) return;
+
+      const modifier = event.metaKey || event.ctrlKey;
+      if (modifier && event.key.toLowerCase() === "z") {
+        event.preventDefault();
+        if (event.shiftKey) redo();
+        else undo();
+      } else if (modifier && event.key.toLowerCase() === "y") {
+        event.preventDefault();
+        redo();
+      } else if (!modifier && !event.altKey) {
+        const shortcuts: Record<string, Tool> = { p: "pen", r: "rectangle", o: "ellipse", l: "line" };
+        const selectedTool = shortcuts[event.key.toLowerCase()];
+        if (selectedTool) setTool(selectedTool);
+        else if (event.key.toLowerCase() === "n") addNote();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [addNote, redo, undo]);
+
+  const exportBoard = async (format: "svg" | "png") => {
+    const width = window.innerWidth;
+    const height = window.innerHeight;
+    const strokeMarkup = strokes.map((stroke) => `<path d="${toPath(stroke as Stroke)}" fill="${escapeXml(stroke.color)}"/>`).join("");
+    const shapeMarkup = shapes.map((shape) => {
+      const stroke = `fill="none" stroke="${escapeXml(shape.color)}" stroke-width="${shape.strokeWidth}"`;
+      if (shape.kind === "line") {
+        return `<line x1="${shape.x}" y1="${shape.y}" x2="${shape.x + shape.width}" y2="${shape.y + shape.height}" ${stroke}/>`;
+      }
+      if (shape.kind === "ellipse") {
+        return `<ellipse cx="${shape.x + shape.width / 2}" cy="${shape.y + shape.height / 2}" rx="${Math.abs(shape.width) / 2}" ry="${Math.abs(shape.height) / 2}" ${stroke}/>`;
+      }
+      return `<rect x="${Math.min(shape.x, shape.x + shape.width)}" y="${Math.min(shape.y, shape.y + shape.height)}" width="${Math.abs(shape.width)}" height="${Math.abs(shape.height)}" ${stroke}/>`;
+    }).join("");
+    const noteMarkup = notes.map((note) => {
+      const lines = note.text.split("\n").map((line, index) =>
+        `<tspan x="${note.x + 10}" dy="${index === 0 ? 0 : 18}">${escapeXml(line)}</tspan>`
+      ).join("");
+      return `<g><rect x="${note.x}" y="${note.y}" width="176" height="160" rx="5" fill="${escapeXml(note.color)}"/><text x="${note.x + 10}" y="${note.y + 44}" fill="#111827" font-family="Arial,sans-serif" font-size="14">${lines}</text></g>`;
+    }).join("");
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}"><defs><pattern id="grid" width="20" height="20" patternUnits="userSpaceOnUse"><circle cx="1" cy="1" r="1" fill="#d4d4d8"/></pattern></defs><rect width="100%" height="100%" fill="#fafafa"/><rect width="100%" height="100%" fill="url(#grid)"/>${strokeMarkup}${shapeMarkup}${noteMarkup}</svg>`;
+    const file = new Blob([svg], { type: "image/svg+xml;charset=utf-8" });
+    const sourceUrl = URL.createObjectURL(file);
+    let downloadUrl = sourceUrl;
+    const link = document.createElement("a");
+    link.download = `canvas-${roomId.replace(/[^\w-]/g, "_")}.${format}`;
+
+    try {
+      if (format === "svg") {
+        link.href = sourceUrl;
+      } else {
+        const image = new Image();
+        image.src = sourceUrl;
+        await image.decode();
+        const canvas = document.createElement("canvas");
+        canvas.width = width * window.devicePixelRatio;
+        canvas.height = height * window.devicePixelRatio;
+        const context = canvas.getContext("2d");
+        if (!context) throw new Error("Could not create an image export context.");
+        context.scale(window.devicePixelRatio, window.devicePixelRatio);
+        context.drawImage(image, 0, 0, width, height);
+        const png = await new Promise<Blob>((resolve, reject) => {
+          canvas.toBlob((blob) => blob ? resolve(blob) : reject(new Error("The browser could not create a PNG.")), "image/png");
+        });
+        downloadUrl = URL.createObjectURL(png);
+        link.href = downloadUrl;
+      }
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      setExportMessage(`Board exported as ${format.toUpperCase()}.`);
+      window.setTimeout(() => setExportMessage(""), 2500);
+    } catch (error) {
+      console.error("Board export failed.", error);
+      setExportMessage("Export failed. Please try again.");
+      window.setTimeout(() => setExportMessage(""), 3500);
+    } finally {
+      link.remove();
+      URL.revokeObjectURL(sourceUrl);
+      if (downloadUrl !== sourceUrl) URL.revokeObjectURL(downloadUrl);
+    }
+  };
 
   const pos = (e: PE) => ({ x: e.clientX, y: e.clientY });
 
@@ -218,7 +320,27 @@ function Board() {
         </button>
       </header>
 
+      <div className="fixed right-5 top-5 z-40 flex items-center gap-2 rounded-2xl border border-black/5 bg-white/90 p-2 shadow-lg backdrop-blur">
+        <button onClick={() => void exportBoard("svg")} className="rounded-lg px-3 py-1.5 text-sm font-medium text-gray-700 hover:bg-violet-50 hover:text-violet-700">Export SVG</button>
+        <button onClick={() => void exportBoard("png")} className="rounded-lg bg-violet-600 px-3 py-1.5 text-sm font-semibold text-white hover:bg-violet-700">Export PNG</button>
+      </div>
+
       <div className="fixed bottom-6 left-1/2 z-40 flex max-w-[calc(100vw-24px)] -translate-x-1/2 flex-wrap items-center justify-center gap-2 rounded-2xl border border-black/5 bg-white/95 px-3 py-2 shadow-xl backdrop-blur">
+        <button
+          onClick={undo}
+          disabled={!canUndo}
+          title="Undo (Ctrl/⌘ Z)"
+          aria-label="Undo"
+          className="rounded-lg px-2.5 py-1.5 text-sm font-medium text-gray-700 hover:bg-gray-100 disabled:cursor-not-allowed disabled:opacity-35"
+        >↶</button>
+        <button
+          onClick={redo}
+          disabled={!canRedo}
+          title="Redo (Ctrl/⌘ Shift Z)"
+          aria-label="Redo"
+          className="rounded-lg px-2.5 py-1.5 text-sm font-medium text-gray-700 hover:bg-gray-100 disabled:cursor-not-allowed disabled:opacity-35"
+        >↷</button>
+        <span className="mx-1 h-6 w-px bg-gray-200" />
         {(["pen", "rectangle", "ellipse", "line"] as Tool[]).map((item) => (
           <button
             key={item}
@@ -249,6 +371,7 @@ function Board() {
         </button>
         <span className="ml-1 rounded-full bg-gray-100 px-2 py-0.5 text-xs text-gray-500">{others.length + 1} online</span>
       </div>
+      {exportMessage && <div role="status" className="fixed bottom-24 left-1/2 z-40 -translate-x-1/2 rounded-full bg-gray-900 px-4 py-2 text-sm font-medium text-white shadow-lg">{exportMessage}</div>}
     </main>
   );
 }
@@ -293,7 +416,7 @@ export default function Page() {
   return (
     <RoomProvider id={`whiteboard:${roomId}`} initialPresence={init} initialStorage={initialStorage}>
       <ClientSideSuspense fallback={<div className="grid h-screen place-items-center text-gray-400">Loading…</div>}>
-        <Board />
+        <Board roomId={roomId} />
       </ClientSideSuspense>
     </RoomProvider>
   );
